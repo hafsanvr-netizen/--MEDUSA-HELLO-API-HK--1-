@@ -25,8 +25,9 @@ WRONG_KEY_RESPONSE = {
 # -------------------------------
 
 LIKES_PER_TOKEN_PER_DAY = 150
-LIKES_PER_USER_REQUEST = 220          # প্রতিটি ইউজারকে ২২০+ লাইক দেওয়ার টার্গেট
-TOKEN_FILE = "token_bd.json"          # একটাই টোকেন ফাইল (২০০+ গেস্ট আইডি)
+LIKES_PER_USER_REQUEST = 800          # প্রতি ইউজারকে ৮০০ টোকেন/আইডি দিয়ে লাইক
+GUEST_ID_DAILY_LIMIT = 190            # একটি গেস্ট আইডি দিনে সর্বোচ্চ ১৯০ বার লাইক দিতে পারবে
+TOKEN_FILE = "token_bd.json"          # একটাই টোকেন ফাইল (৮০০+ গেস্ট আইডি)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -44,7 +45,8 @@ def _today_utc():
 def load_state():
     default = {
         "date": _today_utc(),
-        "usage": {}
+        "usage": {},            # token -> used likes today
+        "guest_usage": {}       # guest uid -> likes given today
     }
     if not os.path.exists(STATE_FILE):
         return default
@@ -55,6 +57,7 @@ def load_state():
             print("New UTC day -> resetting limits")
             return default
         state.setdefault("usage", {})
+        state.setdefault("guest_usage", {})
         return state
     except Exception as e:
         print(f"State load error: {e}")
@@ -202,9 +205,7 @@ def get_like_api_url(server_name):
 
 
 def select_tokens_for_likes(all_tokens, required_count, state):
-    """প্রয়োজনীয় সংখ্যক টোকেন বাছাই করে যেগুলোর দৈনিক লিমিট বাকি আছে।
-    সব টোকেন ব্যবহার করার চেষ্টা করে (যদি required_count এর বেশি টোকেন থাকে,
-    তবে যতগুলো প্রয়োজন ততগুলোই নেবে)।"""
+    """প্রয়োজনীয় সংখ্যক টোকেন বাছাই করে যেগুলোর দৈনিক লিমিট বাকি আছে।"""
     usage = state["usage"]
     selected = []
     for token_dict in all_tokens:
@@ -254,6 +255,21 @@ def handle_requests():
     if not uid_param:
         return jsonify({"error": "UID is required", "credits": "@HAFSAN_KUN"}), 400
 
+    # গেস্ট আইডি দৈনিক লিমিট চেক (একটি গেস্ট আইডি দিনে ১৯০ বার লাইক দিতে পারবে)
+    with state_lock:
+        state = load_state()
+        guest_used = state["guest_usage"].get(str(uid_param), 0)
+
+    if guest_used >= GUEST_ID_DAILY_LIMIT:
+        return jsonify({
+            "error": "Guest ID daily like limit reached",
+            "message": f"This guest ID ({uid_param}) has already given {guest_used}/{GUEST_ID_DAILY_LIMIT} likes today (UTC). Try again tomorrow.",
+            "guest_id": int(uid_param),
+            "guest_daily_used": guest_used,
+            "guest_daily_limit": GUEST_ID_DAILY_LIMIT,
+            "credits": "@HAFSAN_KUN"
+        }), 429
+
     all_tokens = load_all_tokens()
     if not all_tokens:
         return jsonify({
@@ -273,11 +289,29 @@ def handle_requests():
     before_likes = int(before_info.AccountInfo.Likes) if (before_info and hasattr(before_info, 'AccountInfo')) else 0
     print(f"UID {uid_param}: before = {before_likes}")
 
-    # ২২০+ লাইক দেওয়ার জন্য যত টোকেন দরকার ততগুলো বাছাই করি
-    # (প্রতি টোকেন ১টি লাইক দেয়, তাই ২২০ লাইকের জন্য ২২০টি টোকেন দরকার)
+    # গেস্ট আইডির বাকি কোটার ভিত্তিতে কত লাইক দিতে হবে ঠিক করি
     with state_lock:
         state = load_state()
-        selected = select_tokens_for_likes(all_tokens, LIKES_PER_USER_REQUEST, state)
+        guest_used = state["guest_usage"].get(str(uid_param), 0)
+        remaining_for_guest = GUEST_ID_DAILY_LIMIT - guest_used
+
+    target_likes = min(LIKES_PER_USER_REQUEST, remaining_for_guest)
+
+    if target_likes <= 0:
+        return jsonify({
+            "LikesGivenByAPI": 0,
+            "LikesafterCommand": before_likes,
+            "LikesbeforeCommand": before_likes,
+            "PlayerNickname": "N/A",
+            "UID": int(uid_param),
+            "status": 2,
+            "message": "Guest ID daily like limit already reached.",
+            "credits": "@HAFSAN_KUN"
+        })
+
+    with state_lock:
+        state = load_state()
+        selected = select_tokens_for_likes(all_tokens, target_likes, state)
 
     if not selected:
         return jsonify({
@@ -313,11 +347,16 @@ def handle_requests():
     with state_lock:
         state = load_state()
         usage = state["usage"]
+        guest_usage = state["guest_usage"]
         for (td, _u), res in zip(selected, results):
             if isinstance(res, int) and res == 200:
                 tok = td["token"]
                 usage[tok] = usage.get(tok, 0) + 1
                 success_count += 1
+        # গেস্ট আইডির সফল লাইক কাউন্টে যোগ করি
+        if success_count > 0:
+            gkey = str(uid_param)
+            guest_usage[gkey] = guest_usage.get(gkey, 0) + success_count
         save_state(state)
 
     after_info = make_profile_check_request(enc_uid, server_name_param, profile_token)
@@ -335,8 +374,10 @@ def handle_requests():
     with state_lock:
         state = load_state()
         usage = state["usage"]
+        guest_usage = state["guest_usage"]
     total_used = sum(usage.values())
     total_cap = len(all_tokens) * LIKES_PER_TOKEN_PER_DAY
+    guest_used_now = guest_usage.get(str(uid_param), 0)
 
     return jsonify({
         "LikesGivenByAPI": increment,
@@ -347,6 +388,11 @@ def handle_requests():
         "status": status,
         "TokensUsedThisRequest": len(selected),
         "SuccessfulSends": success_count,
+        "GuestDaily": {
+            "used": guest_used_now,
+            "limit": GUEST_ID_DAILY_LIMIT,
+            "remaining": max(0, GUEST_ID_DAILY_LIMIT - guest_used_now)
+        },
         "DailyUsage": {
             "used": total_used,
             "capacity": total_cap,
@@ -366,6 +412,7 @@ def token_info():
     with state_lock:
         state = load_state()
         usage = state["usage"]
+        guest_usage = state["guest_usage"]
 
     used = sum(usage.get(t["token"], 0) for t in all_tokens)
     cap = len(all_tokens) * LIKES_PER_TOKEN_PER_DAY
@@ -381,8 +428,10 @@ def token_info():
         },
         "config": {
             "LIKES_PER_TOKEN_PER_DAY": LIKES_PER_TOKEN_PER_DAY,
-            "LIKES_PER_USER_REQUEST": LIKES_PER_USER_REQUEST
+            "LIKES_PER_USER_REQUEST": LIKES_PER_USER_REQUEST,
+            "GUEST_ID_DAILY_LIMIT": GUEST_ID_DAILY_LIMIT
         },
+        "guest_ids_tracked": len(guest_usage),
         "credits": "@HAFSAN_KUN"
     })
 
