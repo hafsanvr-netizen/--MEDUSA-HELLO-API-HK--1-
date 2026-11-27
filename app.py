@@ -7,6 +7,7 @@ import aiohttp
 import requests
 import json
 import os
+import base64
 import like_pb2
 import like_count_pb2
 import uid_generator_pb2
@@ -24,8 +25,9 @@ WRONG_KEY_RESPONSE = {
 }
 # -------------------------------
 
-LIKES_PER_TOKEN_PER_DAY = 22          # ← প্রতি guest id দিনে ৩০ বার লাইক
+LIKES_PER_TOKEN_PER_DAY = 22          # ← প্রতি guest id দিনে ২২ বার লাইক
 TOKEN_FILE = "token_bd.json"          # সব guest id এখান থেকে লোড হবে
+TOKEN_VISIT_FILE = "token_visit.json" # visit endpoint-এর টোকেন
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -93,6 +95,18 @@ def load_all_tokens():
     tokens = load_token_file(TOKEN_FILE)
     print(f"Loaded {len(tokens)} tokens from {TOKEN_FILE}")
     return tokens
+
+
+def get_uid_from_token(token):
+    """JWT token থেকে account_id (uid) বের করে"""
+    try:
+        payload = token.split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return int(data.get("account_id"))
+    except Exception as e:
+        print(f"JWT decode error: {e}")
+        return None
 
 
 def encrypt_message(plaintext):
@@ -200,7 +214,7 @@ def get_like_api_url(server_name):
 def select_tokens_for_likes(all_tokens, state):
     """
     token_bd.json এর সব guest ID ব্যবহার করে।
-    প্রতিটি টোকেন দিনে LIKES_PER_TOKEN_PER_DAY (30) বার লাইক দিতে পারবে।
+    প্রতিটি টোকেন দিনে LIKES_PER_TOKEN_PER_DAY বার লাইক দিতে পারবে।
     যেগুলোর লিমিট শেষ, সেগুলো বাদ যাবে।
     """
     usage = state["usage"]
@@ -241,10 +255,12 @@ def home():
         "status": "online",
         "endpoints": {
             "/like": "?key=YOUR_KEY&uid=UID&server_name=BD",
-            "/token_info": "?key=YOUR_KEY"
+            "/token_info": "?key=YOUR_KEY",
+            "/visit": "?key=YOUR_KEY"
         },
         "config": {
             "token_file": TOKEN_FILE,
+            "visit_token_file": TOKEN_VISIT_FILE,
             "total_tokens_loaded": len(all_tokens),
             "likes_per_token_per_day": LIKES_PER_TOKEN_PER_DAY,
             "daily_capacity": total_cap
@@ -290,7 +306,6 @@ def handle_requests():
     before_likes = int(before_info.AccountInfo.Likes) if (before_info and hasattr(before_info, 'AccountInfo')) else 0
     print(f"UID {uid_param}: before = {before_likes}")
 
-    # token_bd.json এর সব guest ID ব্যবহার করবে (যাদের 30/দিন লিমিট বাকি)
     with state_lock:
         state = load_state()
         selected = select_tokens_for_likes(all_tokens, state)
@@ -369,6 +384,62 @@ def handle_requests():
             "capacity": total_cap,
             "remaining": remaining
         },
+        "credits": "@HAFSAN_KUN"
+    })
+
+
+@app.route('/visit', methods=['GET'])
+def visit_profiles():
+    """
+    token_visit.json-এর প্রতিটি টোকেন দিয়ে সেই টোকেনের নিজের
+    profile (uid, nickname, likes) নিয়ে আসে।
+    """
+    key = request.args.get('key')
+    if key != API_KEY:
+        return jsonify(WRONG_KEY_RESPONSE), 401
+
+    tokens = load_token_file(TOKEN_VISIT_FILE)
+    if not tokens:
+        return jsonify({
+            "error": f"No tokens loaded from {TOKEN_VISIT_FILE}",
+            "credits": "@HAFSAN_KUN"
+        }), 500
+
+    results = []
+    for td in tokens:
+        tok = td["token"]
+        uid = get_uid_from_token(tok)
+        if not uid:
+            results.append({
+                "token_preview": tok[:8] + "...",
+                "error": "invalid token (JWT decode failed)"
+            })
+            continue
+
+        enc_uid = enc_profile_check_payload(uid)
+        info = make_profile_check_request(enc_uid, "BD", td)
+
+        if info and hasattr(info, 'AccountInfo'):
+            results.append({
+                "token_preview": tok[:8] + "...",
+                "uid": int(info.AccountInfo.UID),
+                "nickname": str(info.AccountInfo.PlayerNickname),
+                "likes": int(info.AccountInfo.Likes)
+            })
+        else:
+            results.append({
+                "token_preview": tok[:8] + "...",
+                "uid": uid,
+                "error": "profile fetch failed (token expired or API error)"
+            })
+
+    success = sum(1 for r in results if "error" not in r)
+    return jsonify({
+        "file": TOKEN_VISIT_FILE,
+        "total_tokens": len(tokens),
+        "success": success,
+        "failed": len(tokens) - success,
+        "profiles": results,
         "credits": "@HAFSAN_KUN"
     })
 
